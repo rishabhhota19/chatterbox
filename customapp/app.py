@@ -121,9 +121,14 @@ Focus on storytelling with clear narrative flow, interesting characters, and des
     
     return None
 
-def chunk_text(text, max_chars=200):
-    """Split text into smaller chunks to avoid TTS timeouts/freezes."""
-    # Split by sentence endings first
+def chunk_text(text, max_tokens=250):
+    """Split text into chunks based on token limit (approx 250 tokens)."""
+    # Estimate tokens: 1 token ≈ 4 characters
+    # So 250 tokens ≈ 1000 characters
+    # Reduced from 900 because input+output length was exceeding model limits
+    max_chars = max_tokens * 4
+    
+    # Split by sentence endings first to avoid cutting mid-sentence
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current_chunk = ""
@@ -143,9 +148,13 @@ def chunk_text(text, max_chars=200):
 
 def generate_audio_chunked(model, text, ref_audio_path=None, model_type="chatterbox"):
     """Generate audio for long text by chunking."""
-    # XTTS can handle longer chunks, but let's keep it safe
-    chunk_size = 200 if model_type == "chatterbox" else 400
-    chunks = chunk_text(text, max_chars=chunk_size)
+    # Chatterbox limit is around 1000 tokens. We use 250 to be safe.
+    # XTTS can handle more, but we'll stick to the same logic for consistency or increase if needed.
+    token_limit = 250 if model_type == "chatterbox" else 500
+    chunks = chunk_text(text, max_tokens=token_limit)
+    
+    st.info(f"Processing on device: {DEVICE} (GPU available: {torch.cuda.is_available()})")
+    
     audio_segments = []
     
     progress_bar = st.progress(0)
