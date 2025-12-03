@@ -4,6 +4,9 @@ from pathlib import Path
 import time
 import re
 
+# Suppress Coqui TTS license agreement prompt
+os.environ["COQUI_TOS_AGREED"] = "1"
+
 # Add src to path to import chatterbox
 current_dir = Path(__file__).parent.resolve()
 src_path = current_dir.parent / "src"
@@ -15,8 +18,25 @@ import numpy as np
 import soundfile as sf
 import google.generativeai as genai
 
+# Monkey-patch torch.load to enable weights_only=False by default
+# This is required because Coqui TTS checkpoints contain custom classes
+# and PyTorch 2.6+ defaults to weights_only=True which breaks loading.
+_original_load = torch.load
+
+def safe_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+
+torch.load = safe_load
+
 # Import Chatterbox
 from chatterbox.tts import ChatterboxTTS
+# Import Coqui TTS
+try:
+    from TTS.api import TTS
+except ImportError:
+    TTS = None
 
 # Constants
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,9 +44,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 st.set_page_config(page_title="StoryGen & Chatterbox TTS", layout="wide")
 
 @st.cache_resource
-def load_tts_model():
+def load_chatterbox_model():
     """Load the Chatterbox TTS model."""
     return ChatterboxTTS.from_pretrained(DEVICE)
+
+@st.cache_resource
+def load_xtts_model():
+    """Load the Coqui XTTS v2 model."""
+    # This will download the model on first use
+    return TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
 
 def generate_story(prompt, max_words=2000, api_key=None):
     """Generate a story using Gemini API."""
@@ -95,8 +121,8 @@ Focus on storytelling with clear narrative flow, interesting characters, and des
     
     return None
 
-def chunk_text(text, max_chars=300):
-    """Split text into chunks to avoid TTS timeouts/freezes."""
+def chunk_text(text, max_chars=200):
+    """Split text into smaller chunks to avoid TTS timeouts/freezes."""
     # Split by sentence endings first
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
@@ -115,37 +141,66 @@ def chunk_text(text, max_chars=300):
         
     return chunks
 
-def generate_audio_chunked(model, text, ref_audio_path=None):
+def generate_audio_chunked(model, text, ref_audio_path=None, model_type="chatterbox"):
     """Generate audio for long text by chunking."""
-    chunks = chunk_text(text)
+    # XTTS can handle longer chunks, but let's keep it safe
+    chunk_size = 200 if model_type == "chatterbox" else 400
+    chunks = chunk_text(text, max_chars=chunk_size)
     audio_segments = []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Prepare conditionals once if reference audio is provided
-    if ref_audio_path:
+    # Prepare conditionals once if reference audio is provided (Chatterbox only)
+    if model_type == "chatterbox" and ref_audio_path:
         model.prepare_conditionals(ref_audio_path)
     
     total_chunks = len(chunks)
+    sample_rate = model.sr if model_type == "chatterbox" else 24000 # XTTS usually 24k
     
     for i, chunk in enumerate(chunks):
-        status_text.text(f"Synthesizing chunk {i+1}/{total_chunks}...")
+        status_text.text(f"Synthesizing chunk {i+1}/{total_chunks}: '{chunk[:30]}...'")
         
-        # Generate audio for the chunk
-        # Note: We don't pass audio_prompt_path here if we already prepared conditionals
-        # to avoid re-processing it every time.
         try:
-            wav = model.generate(
-                chunk,
-                audio_prompt_path=None, # Already prepared
-                temperature=0.7, # Default
-            )
-            # wav is (1, samples) tensor
-            audio_segments.append(wav.squeeze(0).cpu().numpy())
+            wav = None
+            if model_type == "chatterbox":
+                # Chatterbox generation
+                wav_tensor = model.generate(
+                    chunk,
+                    audio_prompt_path=None, # Already prepared
+                    temperature=0.7,
+                )
+                if wav_tensor is not None and wav_tensor.shape[1] > 0:
+                    wav = wav_tensor.squeeze(0).cpu().numpy()
+                    sample_rate = model.sr
+            
+            elif model_type == "xtts":
+                # XTTS generation
+                # tts() returns a list of floats
+                wav_list = model.tts(
+                    text=chunk,
+                    speaker_wav=ref_audio_path,
+                    language="en"
+                )
+                wav = np.array(wav_list)
+                # XTTS sample rate is usually 24000, but let's check if we can get it from model?
+                # model.synthesizer.output_sample_rate might exist, but hardcoding 24000 is common for XTTS v2
+                sample_rate = 24000 
+
+            # Process the audio chunk
+            if wav is not None and len(wav) > 0:
+                duration = len(wav) / sample_rate
+                st.info(f"Chunk {i+1} generated: {duration:.2f}s")
+                
+                # Play chunk immediately
+                st.audio(wav, sample_rate=sample_rate)
+                
+                audio_segments.append(wav)
+            else:
+                st.warning(f"Chunk {i+1} returned empty audio.")
+
         except Exception as e:
             st.error(f"Error generating chunk {i+1}: {e}")
-            # Continue or break? Let's continue with silence or skip
             continue
             
         progress_bar.progress((i + 1) / total_chunks)
@@ -155,15 +210,19 @@ def generate_audio_chunked(model, text, ref_audio_path=None):
 
     # Concatenate all segments
     full_audio = np.concatenate(audio_segments)
-    return model.sr, full_audio
+    return sample_rate, full_audio
 
 def main():
     st.title("📚 StoryGen & Chatterbox TTS")
-    st.markdown("Generate long stories and convert them to speech using Chatterbox.")
+    st.markdown("Generate long stories and convert them to speech using Chatterbox or XTTS v2.")
 
     # Sidebar for controls
     with st.sidebar:
         st.header("Settings")
+        
+        # Model Selection
+        st.subheader("🔊 TTS Model")
+        tts_model_name = st.selectbox("Select Model", ["Chatterbox", "XTTS v2"])
         
         # Gemini API Key
         st.subheader("🤖 Gemini API")
@@ -267,9 +326,22 @@ def main():
         
         # 2. Generate Audio
         st.subheader("Audio Generation")
-        tts_model = load_tts_model()
         
-        sr, audio_data = generate_audio_chunked(tts_model, story_text, str(final_ref_path))
+        model = None
+        model_type = "chatterbox"
+        
+        if tts_model_name == "Chatterbox":
+            model = load_chatterbox_model()
+            model_type = "chatterbox"
+        elif tts_model_name == "XTTS v2":
+            if TTS is None:
+                st.error("TTS library not installed. Please install it to use XTTS v2.")
+                return
+            with st.spinner("Loading XTTS v2 model..."):
+                model = load_xtts_model()
+            model_type = "xtts"
+        
+        sr, audio_data = generate_audio_chunked(model, story_text, str(final_ref_path), model_type=model_type)
         
         if audio_data is not None:
             st.success("Audio generation complete!")
