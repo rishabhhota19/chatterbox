@@ -176,15 +176,16 @@ def generate_audio_chunked(model, text, ref_audio_path=None, model_type="chatter
             
             elif model_type == "xtts":
                 # XTTS generation
-                # tts() returns a list of floats
-                wav_list = model.tts(
-                    text=chunk,
-                    speaker_wav=ref_audio_path,
-                    language="en"
-                )
+                # Use a spinner because tts() is blocking and might take time
+                with st.spinner(f"Generating XTTS audio for chunk {i+1}..."):
+                    # tts() returns a list of floats
+                    wav_list = model.tts(
+                        text=chunk,
+                        speaker_wav=ref_audio_path,
+                        language="en"
+                    )
                 wav = np.array(wav_list)
-                # XTTS sample rate is usually 24000, but let's check if we can get it from model?
-                # model.synthesizer.output_sample_rate might exist, but hardcoding 24000 is common for XTTS v2
+                # XTTS sample rate is usually 24000
                 sample_rate = 24000 
 
             # Process the audio chunk
@@ -201,6 +202,8 @@ def generate_audio_chunked(model, text, ref_audio_path=None, model_type="chatter
 
         except Exception as e:
             st.error(f"Error generating chunk {i+1}: {e}")
+            # Log the full error for debugging
+            print(f"Error in chunk {i+1}: {e}")
             continue
             
         progress_bar.progress((i + 1) / total_chunks)
